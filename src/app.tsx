@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, lineOutput, makeCorrection, makeRule, outputText, previewCorrection, reconfirmCorrection, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { CorrectionPreview, HistoryState, LocalCorrection, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -55,7 +55,7 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      return analyzeProject({ ...parsed, corrections: parsed.corrections ?? [] });
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -91,6 +91,28 @@ function issueLabel(issue: ProofIssue): string {
   if (issue.severity === 'error') return '阻断';
   if (issue.severity === 'warning') return '可疑';
   return '建议';
+}
+
+function correctionStatusLabel(correction: LocalCorrection): string {
+  switch (correction.status) {
+    case 'pending':
+      return '待确认';
+    case 'kept':
+      return '已批准';
+    case 'revoked':
+      return '已撤销';
+    case 'expired':
+      return correction.staleReason === 'braille-changed' ? '过期·盲文已变' : '过期·原文已变';
+    default:
+      return '';
+  }
+}
+
+function correctionStaleHint(correction: LocalCorrection): string {
+  if (correction.status !== 'expired') return '';
+  if (correction.staleReason === 'fragment-missing') return '原文片段已找不到，改字无法继续使用。';
+  if (correction.staleReason === 'fragment-ambiguous') return '片段出现多处，无法判断应跟随哪一处。';
+  return '该段自动盲文已变化；确认替换内容仍合适后可保留，否则请撤销。';
 }
 
 function Section({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ComponentChildren; children: ComponentChildren }) {
@@ -215,24 +237,57 @@ function LineCard({
   index,
   selected,
   issues,
+  corrections,
   onSelect,
   onChange,
   onNote,
   onStatus,
   onDelete,
+  onCreateCorrection,
+  onPreviewSelection,
 }: {
   line: TextbookLine;
   index: number;
   selected: boolean;
   issues: ProofIssue[];
+  corrections: LocalCorrection[];
   onSelect: () => void;
   onChange: (source: string) => void;
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onCreateCorrection: (selectionStart: number, selectionEnd: number, replacement: string, reason: string) => void;
+  onPreviewSelection: (selectionStart: number, selectionEnd: number) => CorrectionPreview | undefined;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [draft, setDraft] = useState<{ start: number; end: number; replacement: string; reason: string } | null>(null);
+
+  // 原文一旦变动，基于旧选区的草稿立即作废，避免按偏移错配。
+  useEffect(() => {
+    setDraft(null);
+  }, [line.source]);
+
+  const lineCorrections = corrections.filter(
+    (correction) => (correction.locatedLineId ?? correction.lineId) === line.id && correction.status !== 'revoked',
+  );
+
+  const openDraft = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    setDraft({ start: textarea.selectionStart ?? 0, end: textarea.selectionEnd ?? 0, replacement: '', reason: '' });
+  };
+
+  const draftPreview = draft ? onPreviewSelection(draft.start, draft.end) : undefined;
+  const draftFragment = draftPreview?.fragment ?? '';
+  const draftStale = Boolean(draft && (!draftPreview || draftPreview.staleReason));
+  const duplicate = Boolean(
+    draftFragment && lineCorrections.some(
+      (correction) => (correction.status === 'pending' || correction.status === 'kept') && correction.fragment === draftFragment,
+    ),
+  );
+  const draftBlocked = !draft || !draftFragment || draftStale || duplicate || !draft.replacement.trim();
 
   return (
     <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
@@ -243,33 +298,89 @@ function LineCard({
       <div class="line-body">
         <div class="line-source">
           <textarea
-            aria-label={`第 ${index + 1} 行原文`}
+            ref={textareaRef}
+            aria-label={`第 ${index + 1} 行原文，选中片段后可添加局部改字`}
             value={line.source}
             rows={Math.max(1, Math.ceil(line.source.length / 52))}
             onFocus={onSelect}
             onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
           />
-          <div class="line-actions">
+          <div class="line-actions five">
+            <md-icon-button aria-label="为选中片段添加局部改字" title="为选中片段添加局部改字" onClick={(event: MouseEvent) => { event.stopPropagation(); openDraft(); }}>改</md-icon-button>
             <md-icon-button aria-label="标记待核对" title="标记待核对" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('questionable'); }}>?</md-icon-button>
             <md-icon-button aria-label="标记已校对" title="标记已校对" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('reviewed'); }}>✓</md-icon-button>
             <md-icon-button aria-label="批准此行" title="批准此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('approved'); }}>★</md-icon-button>
             <md-icon-button aria-label="删除此行" title="删除此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onDelete(); }}>×</md-icon-button>
           </div>
         </div>
+
+        {draft && (
+          <div class="correction-draft" onClick={(event: MouseEvent) => event.stopPropagation()}>
+            <div class="correction-draft-head">
+              <strong>局部改字</strong>
+              {draftFragment
+                ? <code>“{draftFragment}”</code>
+                : <span class="draft-error">请先在原文中选中一个片段</span>}
+            </div>
+            {draftStale && (
+              <p class="draft-error">
+                {draftPreview?.staleReason === 'fragment-ambiguous' ? '该片段在全文出现多处，无法唯一定位，请扩大选区。' : '选区未对齐到可转写的文字，请重新选择。'}
+              </p>
+            )}
+            {duplicate && <p class="draft-error">该片段已有生效中的改字，请先在右侧“改字”面板撤销旧记录。</p>}
+            <div class="correction-draft-grid">
+              <md-outlined-text-field
+                label="替换盲文（转录优先采用）"
+                value={draft.replacement}
+                onInput={(event: any) => setDraft({ ...draft, replacement: event.currentTarget.value })}
+              />
+              <md-outlined-text-field
+                label="原因"
+                value={draft.reason}
+                onInput={(event: any) => setDraft({ ...draft, reason: event.currentTarget.value })}
+              />
+            </div>
+            {draftPreview?.autoBraille && (
+              <p class="draft-baseline">该片段自动盲文：<b>{draftPreview.autoBraille}</b>，留作日后判断规则是否变化的基线。</p>
+            )}
+            <div class="correction-draft-actions">
+              <md-text-button onClick={() => setDraft(null)}>取消</md-text-button>
+              <md-filled-button
+                disabled={draftBlocked}
+                onClick={() => {
+                  onCreateCorrection(draft.start, draft.end, draft.replacement.trim(), draft.reason.trim());
+                  setDraft(null);
+                }}
+              >
+                保存改字
+              </md-filled-button>
+            </div>
+          </div>
+        )}
+
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
           {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
           {line.tokens.map((token) => (
             token.text === ' ' ? <span class="space-token" title="分词空格" /> : (
               <span
-                class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
-                title={`${token.text || '标记'} → ${token.braille}`}
+                class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''} ${token.override ? 'override' : ''}`}
+                title={token.override ? `局部改字：${token.text} → ${token.braille}` : `${token.text || '标记'} → ${token.braille}`}
               >
-                <b>{token.text || '标记'}</b>
+                <b>{token.override ? '改字' : token.text || '标记'}</b>
                 <span>{token.braille}</span>
               </span>
             )
           ))}
         </div>
+        {lineCorrections.length > 0 && (
+          <div class="line-corrections">
+            {lineCorrections.map((correction) => (
+              <span class={`correction-chip ${correction.status}`} key={correction.id} title={correction.reason}>
+                {correctionStatusLabel(correction)} · “{correction.fragment}” → {correction.replacement}
+              </span>
+            ))}
+          </div>
+        )}
         {lineIssues.length > 0 && (
           <div class="line-warnings">
             {lineIssues.slice(0, 3).map((item) => (
@@ -300,6 +411,8 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onCreateCorrection,
+  onPreviewSelection,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,6 +423,8 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onCreateCorrection: (lineId: string, selectionStart: number, selectionEnd: number, replacement: string, reason: string) => void;
+  onPreviewSelection: (lineId: string, selectionStart: number, selectionEnd: number) => CorrectionPreview | undefined;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -362,11 +477,14 @@ function EditorPanel({
             index={index}
             selected={state.selectedLineId === line.id}
             issues={state.issues}
+            corrections={state.corrections}
             onSelect={() => onSelectLine(line.id)}
             onChange={(source) => onChangeLine(line.id, source)}
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onCreateCorrection={(selectionStart, selectionEnd, replacement, reason) => onCreateCorrection(line.id, selectionStart, selectionEnd, replacement, reason)}
+            onPreviewSelection={(selectionStart, selectionEnd) => onPreviewSelection(line.id, selectionStart, selectionEnd)}
           />
         ))}
       </div>
@@ -479,14 +597,106 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+const CORRECTION_SECTIONS: { title: string; statuses: LocalCorrection['status'][] }[] = [
+  { title: '待教师确认', statuses: ['pending'] },
+  { title: '已过期 · 需核对', statuses: ['expired'] },
+  { title: '已批准保留', statuses: ['kept'] },
+  { title: '已撤销', statuses: ['revoked'] },
+];
+
+function CorrectionsPanel({
+  state,
+  onJump,
+  onKeep,
+  onRevoke,
+  onReconfirm,
+  onRemove,
+}: {
+  state: ProjectState;
+  onJump: (lineId: string) => void;
+  onKeep: (correctionId: string) => void;
+  onRevoke: (correctionId: string) => void;
+  onReconfirm: (correctionId: string) => void;
+  onRemove: (correctionId: string) => void;
+}) {
+  if (state.corrections.length === 0) {
+    return (
+      <div class="empty-state">
+        <span>改</span>
+        <strong>还没有局部改字</strong>
+        <p>在中间校对区选中原文片段，点击“改”，填入替换盲文和原因即可。改字在转录时优先采用。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div class="inspector-body corrections-panel">
+      {CORRECTION_SECTIONS.map((section) => {
+        const items = state.corrections.filter((correction) => section.statuses.includes(correction.status));
+        if (items.length === 0) return null;
+        return (
+          <div class="correction-section" key={section.title}>
+            <h3>{section.title}<span>{items.length}</span></h3>
+            {items.map((correction) => {
+              const lineId = correction.locatedLineId ?? correction.lineId;
+              const lineIndex = state.lines.findIndex((line) => line.id === lineId);
+              return (
+                <div class={`correction-card ${correction.status}`} key={correction.id}>
+                  <div class="correction-card-head">
+                    <span class={`correction-badge ${correction.status}`}>{correctionStatusLabel(correction)}</span>
+                    {lineIndex >= 0 && <md-text-button onClick={() => onJump(lineId)}>第 {lineIndex + 1} 行</md-text-button>}
+                  </div>
+                  <div class="correction-fragment">“{correction.fragment}”</div>
+                  <div class="correction-braille-row">
+                    <span class="correction-auto" title="创建时的自动盲文基线">
+                      {correction.status === 'expired' && correction.staleReason === 'braille-changed' && correction.currentAutoBraille !== undefined
+                        ? correction.currentAutoBraille
+                        : correction.baselineBraille || '—'}
+                    </span>
+                    <span class="arrow-hint" title={correction.status === 'expired' && correction.staleReason === 'braille-changed' ? `创建时基线：${correction.baselineBraille}` : '自动盲文'}>→</span>
+                    <strong class="correction-replacement">{correction.replacement}</strong>
+                  </div>
+                  {correction.reason && <p class="correction-reason">{correction.reason}</p>}
+                  {correction.status === 'expired' && (
+                    <p class="correction-stale-hint">{correctionStaleHint(correction)}</p>
+                  )}
+                  <p class="correction-meta">
+                    {formatTime(correction.createdAt)} 记录
+                    {correction.status === 'expired' && correction.staleReason === 'braille-changed' && ' · 原替换盲文可重新沿用'}
+                  </p>
+                  <div class="correction-actions">
+                    {correction.status === 'pending' && <md-filled-button onClick={() => onKeep(correction.id)}>保留</md-filled-button>}
+                    {correction.status === 'pending' && <md-outlined-button onClick={() => onRevoke(correction.id)}>撤销</md-outlined-button>}
+                    {correction.status === 'kept' && <md-text-button onClick={() => onRevoke(correction.id)}>撤销保留</md-text-button>}
+                    {correction.status === 'expired' && correction.staleReason === 'braille-changed' && (
+                      <md-filled-button onClick={() => onReconfirm(correction.id)}>仍合适，保留</md-filled-button>
+                    )}
+                    {correction.status === 'expired' && <md-outlined-button onClick={() => onRevoke(correction.id)}>撤销</md-outlined-button>}
+                    {correction.status === 'revoked' && (
+                      <md-text-button onClick={() => onRemove(correction.id)}>删除记录</md-text-button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'corrections' | 'rules' | 'versions'>('issues');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
+  const pendingCorrections = state.corrections.filter((correction) => correction.status === 'pending').length;
+  const expiredCorrections = state.corrections.filter((correction) => correction.status === 'expired').length;
+  const activeCorrections = state.corrections.filter((correction) => correction.status === 'pending' || correction.status === 'kept').length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
 
@@ -501,7 +711,11 @@ export default function App() {
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
     commit('更新校对状态', (current) => {
-      const lines = current.lines.map((line) => line.id === lineId ? { ...line, status } : line);
+      const lines = current.lines.map((line) => {
+        if (line.id !== lineId) return line;
+        // 批准时固化最终盲文签名；之后结果一变（原文、规则或改字覆盖变化）即退回待核对。
+        return status === 'approved' ? { ...line, status, approvedOutput: lineOutput(line) } : { ...line, status };
+      });
       const issues = current.issues.map((item) => item.lineId === lineId && status === 'approved' ? { ...item, resolved: true } : item);
       return { ...current, lines, issues, updatedAt: new Date().toISOString() };
     });
@@ -613,6 +827,46 @@ export default function App() {
     }));
   };
 
+  const createCorrection = (lineId: string, selectionStart: number, selectionEnd: number, replacement: string, reason: string) => {
+    commit('添加局部改字', (current) => {
+      // 用当前全文（含周边行移动后的结果）做唯一定位与自动盲文基线。
+      const preview = previewCorrection(current, lineId, selectionStart, selectionEnd);
+      if (!preview || preview.staleReason || !preview.fragment) return current;
+      const duplicate = current.corrections.some(
+        (correction) => (correction.status === 'pending' || correction.status === 'kept')
+          && (correction.locatedLineId ?? correction.lineId) === preview.lineId
+          && correction.fragment === preview.fragment,
+      );
+      if (duplicate) return current;
+      return analyzeProject({ ...current, corrections: [...current.corrections, makeCorrection(preview.lineId, preview, replacement, reason)] });
+    });
+  };
+
+  const updateCorrectionStatus = (label: string, correctionId: string, patch: Partial<LocalCorrection>) => {
+    commit(label, (current) => analyzeProject({
+      ...current,
+      corrections: current.corrections.map((correction) => correction.id === correctionId ? { ...correction, ...patch } : correction),
+    }));
+  };
+
+  const reconfirmStaleCorrection = (correctionId: string) => {
+    commit('重新确认过期改字', (current) => {
+      // 第一次 analyze 刷新当前自动盲文，再以其为新基线转回已批准。
+      const refreshed = analyzeProject(current);
+      const target = refreshed.corrections.find((correction) => correction.id === correctionId);
+      if (!target || target.status !== 'expired' || target.staleReason !== 'braille-changed') return current;
+      return analyzeProject({ ...refreshed, corrections: refreshed.corrections.map((correction) => correction.id === correctionId ? reconfirmCorrection(correction) : correction) });
+    });
+  };
+
+  const removeCorrection = (correctionId: string) => {
+    commit('删除改字记录', (current) => ({
+      ...current,
+      corrections: current.corrections.filter((correction) => correction.id !== correctionId),
+      updatedAt: new Date().toISOString(),
+    }));
+  };
+
   return (
     <div class="app-shell">
       <header class="topbar">
@@ -640,6 +894,7 @@ export default function App() {
         </div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
+        <div class={`status-stat ${expiredCorrections > 0 ? 'warning' : ''}`}><strong>{activeCorrections}</strong><span>生效改字{expiredCorrections > 0 ? ` · ${expiredCorrections} 过期` : ''}</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
@@ -684,12 +939,17 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onCreateCorrection={createCorrection}
+          onPreviewSelection={(lineId, start, end) => previewCorrection(state, lineId, start, end)}
         />
 
         <aside class="right-panel">
-          <div class="inspector-tabs" role="tablist">
+          <div class="inspector-tabs four" role="tablist">
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
-            <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
+            <button class={inspectorTab === 'corrections' ? 'active' : ''} onClick={() => setInspectorTab('corrections')}>
+              改字 {(pendingCorrections + expiredCorrections) > 0 && <span class={expiredCorrections > 0 ? 'danger' : ''}>{pendingCorrections + expiredCorrections}</span>}
+            </button>
+            <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则</button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
@@ -701,6 +961,16 @@ export default function App() {
               onBatchFix={batchFixRule}
             />
           )}
+          {inspectorTab === 'corrections' && (
+            <CorrectionsPanel
+              state={state}
+              onJump={(lineId) => selectLine(lineId, true)}
+              onKeep={(correctionId) => updateCorrectionStatus('批准保留局部改字', correctionId, { status: 'kept', staleReason: undefined, updatedAt: new Date().toISOString() })}
+              onRevoke={(correctionId) => updateCorrectionStatus('撤销局部改字', correctionId, { status: 'revoked', staleReason: undefined, updatedAt: new Date().toISOString() })}
+              onReconfirm={reconfirmStaleCorrection}
+              onRemove={removeCorrection}
+            />
+          )}
           {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onDeleteRule={(ruleId) => {
             commit('删除转录规则', (current) => analyzeProject({
               ...current,
@@ -708,7 +978,9 @@ export default function App() {
             }));
           }} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
-            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
+            // 恢复后重新转录并核对改字状态，旧快照可能没有 corrections 字段。
+            const snapshot = structuredClone(version.snapshot) as Omit<ProjectState, 'versions'> & { corrections?: LocalCorrection[] };
+            const restored: ProjectState = analyzeProject({ ...snapshot, corrections: snapshot.corrections ?? [], versions: state.versions });
             restore(restored);
           }} />}
         </aside>
