@@ -66,9 +66,9 @@ md-text-button, md-filled-button, md-outlined-button, md-filled-tonal-button { w
 .status-ribbon {
   height: 62px;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) repeat(3, 118px) minmax(380px, 1.4fr);
+  grid-template-columns: minmax(240px, 1fr) repeat(4, 108px) minmax(300px, 1.2fr);
   align-items: center;
-  gap: 16px;
+  gap: 14px;
   padding: 7px 20px;
   background: #f5f9f7;
   border-bottom: 1px solid var(--line);
@@ -146,7 +146,7 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
   padding: 8px 3px; color: #1e2b27; font-size: 15px; line-height: 1.55; outline: none;
 }
 .line-source textarea:focus { border-color: #4c806f; background: #fcfefd; }
-.line-actions { display: grid; grid-template-columns: repeat(4, 30px); opacity: .35; transition: opacity .15s; }
+.line-actions { display: grid; grid-template-columns: repeat(5, 30px); opacity: .35; transition: opacity .15s; }
 .line-card:hover .line-actions, .line-card.selected .line-actions { opacity: 1; }
 .braille-preview {
   min-height: 54px; padding: 8px 5px 3px; display: flex; align-items: center; flex-wrap: wrap; gap: 7px;
@@ -166,7 +166,85 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .issue-chip.info { color: #315e70; background: #e2f3f8; }
 .note-field { margin-top: 9px; --md-outlined-text-field-container-height: 42px; }
 
-.inspector-tabs { height: 50px; display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--line); background: white; }
+/* 局部改字 --------------------------------------------------------------- */
+.braille-piece-correction {
+  display: inline-flex; flex-direction: column; align-items: center;
+  padding: 3px 6px 4px; border-radius: 6px;
+  border: 1px dashed #b48a2e;
+}
+.braille-piece-correction b { color: #8a6410; font: 500 9px/1.2 sans-serif; }
+.braille-piece-correction span { margin-top: 3px; font: 22px/1.05 "Apple Braille", "Segoe UI Symbol", sans-serif; }
+.braille-piece-correction.pending { background: #fff4da; box-shadow: inset 0 -2px #e3a342; }
+.braille-piece-correction.approved { background: #e3f4ea; border-color: #4c8a68; box-shadow: inset 0 -2px #4c8a68; }
+.braille-piece-correction.approved b { color: #2f6c51; }
+
+.correction-chips { padding-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.correction-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  border: 1px solid #e3cf9b; background: #fffaee; border-radius: 6px;
+  padding: 3px 7px; cursor: pointer; font-size: 10px; color: #6f5516;
+}
+.correction-chip:hover { border-color: #c79a3f; }
+.correction-chip b { font-weight: 600; text-decoration: line-through; opacity: .75; }
+.correction-chip span { font-family: "Apple Braille", "Segoe UI Symbol", sans-serif; font-size: 13px; color: #3b3114; }
+.correction-chip em { font-style: normal; font-weight: 700; border-radius: 4px; padding: 1px 5px; background: #ecc878; color: #553500; }
+.correction-chip.approved { border-color: #9bc7ae; background: #eef8f2; color: #2c5b45; }
+.correction-chip.approved em { background: #4c8a68; color: white; }
+.correction-chip.approved span { color: #1f4935; }
+.correction-chip.stale { border-color: #d8b0ac; background: #fdf1f0; color: #8c3a30; opacity: .85; }
+.correction-chip.stale em { background: #b3261e; color: white; }
+
+.correction-form {
+  margin-top: 10px; padding: 11px 12px; border: 1px solid #d9bc76; border-radius: 10px;
+  background: #fffaf0;
+}
+.correction-form-head { display: flex; align-items: center; gap: 8px; }
+.correction-form-head strong { font-size: 12px; color: #6b4f10; }
+.correction-fragment { font-size: 11px; color: #8a7540; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.correction-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0 4px; }
+.correction-form-actions { display: flex; justify-content: flex-end; gap: 4px; }
+.correction-warn { margin: 6px 0 0; color: #8c1d18; background: #fde7e5; border-radius: 6px; padding: 5px 8px; font-size: 11px; }
+
+.corrections-panel { display: flex; flex-direction: column; gap: 12px; }
+.correction-intro { font-size: 11px; line-height: 1.55; color: #586863; background: #eef4f1; border-radius: 8px; padding: 9px 11px; }
+.correction-group h3 {
+  margin: 0 0 7px; font-size: 11px; letter-spacing: .05em; color: #527269;
+  display: flex; align-items: center; gap: 6px; text-transform: uppercase;
+}
+.correction-group h3 span {
+  display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: #dbe5e1; color: #3b4b46; font-size: 10px;
+}
+.correction-card {
+  border: 1px solid var(--line); border-left: 3px solid #d9b45f;
+  background: white; border-radius: 9px; padding: 10px 11px; margin-bottom: 8px;
+}
+.correction-card.approved { border-left-color: #4c8a68; }
+.correction-card.stale { border-left-color: var(--danger); background: #fdf6f5; }
+.correction-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.correction-badge {
+  font-size: 10px; font-weight: 700; border-radius: 5px; padding: 2px 7px;
+  background: #f2e2b8; color: #6b4f10; white-space: nowrap;
+}
+.correction-badge.approved { background: #dcede2; color: #2c5b45; }
+.correction-badge.stale { background: #f6dbd8; color: #8c1d18; }
+.correction-location { border: 0; background: transparent; color: var(--muted); font-size: 10px; cursor: pointer; padding: 0; }
+.correction-location:disabled { cursor: default; }
+.correction-swap { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.correction-frag {
+  font-size: 13px; color: #8a6410; background: #faf0d8; border-radius: 5px; padding: 3px 7px;
+  text-decoration: line-through; text-decoration-thickness: 1px;
+}
+.correction-arrow { color: #a08b55; }
+.correction-repl {
+  font: 20px/1.1 "Apple Braille", "Segoe UI Symbol", sans-serif; color: #1f4935;
+  background: #e6f3eb; border-radius: 5px; padding: 2px 8px;
+}
+.correction-reason { margin: 7px 0 0; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.correction-stale-note { margin: 6px 0 0; font-size: 11px; color: #8c1d18; line-height: 1.5; }
+.correction-card-actions { margin-top: 9px; display: flex; justify-content: flex-end; gap: 2px; flex-wrap: wrap; }
+
+.inspector-tabs { height: 50px; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); background: white; }
 .inspector-tabs button { border: 0; border-bottom: 2px solid transparent; background: transparent; cursor: pointer; color: #697671; font-size: 12px; }
 .inspector-tabs button.active { color: #244f43; border-bottom-color: #39715f; font-weight: 700; }
 .inspector-tabs span { display: inline-grid; place-items: center; min-width: 18px; height: 18px; margin-left: 4px; padding: 0 4px; border-radius: 9px; background: #f2c477; color: #553500; font-size: 10px; }
@@ -203,13 +281,13 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 @media (max-width: 1320px) {
   .workspace-grid { grid-template-columns: 285px minmax(520px, 1fr) 330px; }
   .shortcut-hint { display: none; }
-  .status-ribbon { grid-template-columns: minmax(220px, 1fr) repeat(3, 105px); }
+  .status-ribbon { grid-template-columns: minmax(200px, 1fr) repeat(4, 96px); }
   .topbar-center small { display: none; }
 }
 
 @media print {
   body { min-width: 0; overflow: visible; }
-  .topbar, .status-ribbon, .left-panel, .right-panel, .editor-toolbar, .line-actions, .note-field { display: none !important; }
+  .topbar, .status-ribbon, .left-panel, .right-panel, .editor-toolbar, .line-actions, .note-field, .correction-form, .correction-chips { display: none !important; }
   .workspace-grid, .editor-panel, .line-list { display: block; height: auto; overflow: visible; background: white; padding: 0; }
   .line-card { break-inside: avoid; box-shadow: none; }
 }

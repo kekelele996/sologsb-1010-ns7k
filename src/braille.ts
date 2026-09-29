@@ -1,5 +1,6 @@
 import type {
   BrailleToken,
+  LocalCorrection,
   ProofIssue,
   ProjectState,
   RuleSet,
@@ -204,6 +205,16 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
 
 export function analyzeProject(state: ProjectState): ProjectState {
   const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+
+  // 先按现有状态计算每条行的有效盲文（旧自动结果 + 旧改字），用于批准行变化回退。
+  const oldByLine = new Map<string, LocalCorrection[]>();
+  (state.corrections ?? []).forEach((correction) => {
+    if (correction.stale || correction.status === 'revoked' || !correction.lineId) return;
+    oldByLine.set(correction.lineId, [...(oldByLine.get(correction.lineId) ?? []), correction]);
+  });
+  const oldEffective = new Map<string, string>();
+  state.lines.forEach((line) => oldEffective.set(line.id, effectiveBraille(line, oldByLine.get(line.id) ?? [])));
+
   const nextLines: TextbookLine[] = [];
   const issues: ProofIssue[] = [];
 
@@ -215,13 +226,230 @@ export function analyzeProject(state: ProjectState): ProjectState {
     issues.push(...analyzed.issues);
   });
 
+  const corrections = resolveCorrections(state.corrections ?? [], nextLines);
+  const correctionsByLine = new Map<string, LocalCorrection[]>();
+  corrections.forEach((correction) => {
+    if (correction.stale || correction.status === 'revoked' || !correction.lineId) return;
+    correctionsByLine.set(correction.lineId, [...(correctionsByLine.get(correction.lineId) ?? []), correction]);
+  });
+
+  const lines = nextLines.map((line) => {
+    const effective = effectiveBraille(line, correctionsByLine.get(line.id) ?? []);
+    if (line.status === 'approved' && oldEffective.has(line.id) && oldEffective.get(line.id) !== effective) {
+      return { ...line, status: 'questionable' as const };
+    }
+    return line;
+  });
+
   return {
     ...state,
-    lines: nextLines,
+    lines,
+    corrections,
     issues,
     lastCheckedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// 局部改字
+// ---------------------------------------------------------------------------
+
+/** 真正承载原文字符的 token 区间（空格、系统标记除外）。 */
+export function realInterval(token: BrailleToken): [number, number] | null {
+  if (!token.text || token.text === ' ') return null;
+  return [token.offset, token.offset + token.text.length];
+}
+
+function isRealToken(token: BrailleToken): boolean {
+  return realInterval(token) !== null;
+}
+
+/** 把从 start 到 end 的选区吸附到覆盖它的最小真实 token 区间。 */
+export function snapSelection(
+  tokens: BrailleToken[],
+  start: number,
+  end: number,
+): { start: number; end: number } | null {
+  if (start < 0 || end <= start) return null;
+  const real = tokens.filter(isRealToken).sort((a, b) => a.offset - b.offset);
+  const first = real.find((token) => {
+    const interval = realInterval(token)!;
+    return interval[0] <= start && start < interval[1];
+  }) ?? real.find((token) => {
+    const interval = realInterval(token)!;
+    return interval[0] >= start;
+  });
+  const last = [...real].reverse().find((token) => {
+    const interval = realInterval(token)!;
+    return interval[0] < end && interval[1] >= end;
+  }) ?? [...real].reverse().find((token) => {
+    const interval = realInterval(token)!;
+    return interval[1] <= end;
+  });
+  if (!first || !last) return null;
+  const from = first.offset;
+  const to = last.offset + last.text.length;
+  if (to <= from) return null;
+  return { start: from, end: to };
+}
+
+/** 全文中所有片段出现位置（按原文精确匹配）。 */
+export function findOccurrences(lines: TextbookLine[], fragment: string): { lineId: string; start: number; end: number }[] {
+  if (!fragment) return [];
+  const results: { lineId: string; start: number; end: number }[] = [];
+  for (const line of lines) {
+    let index = line.source.indexOf(fragment);
+    while (index !== -1) {
+      results.push({ lineId: line.id, start: index, end: index + fragment.length });
+      index = line.source.indexOf(fragment, index + fragment.length);
+    }
+  }
+  return results;
+}
+
+/** 某一行指定区间的自动盲文（仅真实字符 token，不含空格与系统标记）。 */
+export function autoBrailleForRange(tokens: BrailleToken[], start: number, end: number): string {
+  return tokens
+    .filter((token) => {
+      const interval = realInterval(token);
+      if (!interval) return false;
+      return interval[0] >= start && interval[1] <= end;
+    })
+    .sort((a, b) => a.offset - b.offset)
+    .map((token) => token.braille)
+    .join('');
+}
+
+function activeOnLine(corrections: LocalCorrection[], lineId: string): LocalCorrection[] {
+  return corrections
+    .filter((correction) => !correction.stale && correction.status !== 'revoked' && correction.lineId === lineId && correction.start !== undefined && correction.end !== undefined)
+    .sort((a, b) => (a.start! - b.start!) || (a.end! - b.end!));
+}
+
+/**
+ * 重新匹配每条改字：
+ * - 片段在全文唯一 → 跟随到新位置；周边移动不受影响。
+ * - 找不到 / 多处出现 → 过期，不参与导出。
+ * - 片段在、但该段自动盲文与基线不同（规则或规则集变化）→ 过期。
+ * - 已批准改字若曾经过期、恢复后自动盲文又变 → 退回待核对。
+ */
+export function resolveCorrections(corrections: LocalCorrection[], lines: TextbookLine[]): LocalCorrection[] {
+  const byId = new Map(lines.map((line) => [line.id, line]));
+  return corrections.map((correction) => {
+    // 撤销是终态：记录保留，不再参与匹配/过期判定与导出。
+    if (correction.status === 'revoked') return correction;
+    const occurrences = findOccurrences(lines, correction.fragment);
+
+    if (occurrences.length === 0) {
+      return { ...correction, stale: true, staleReason: 'not-found', lineId: undefined, start: undefined, end: undefined };
+    }
+
+    let occurrence = occurrences[0];
+    if (occurrences.length > 1) {
+      // 原位置仍在（另一处是新出现的）→ 继续锚定原位置；原位置消失导致多义 → 过期。
+      const previous = occurrences.find((item) => item.lineId === correction.lineId && item.start === correction.start)
+        ?? occurrences.find((item) => item.lineId === correction.lineId);
+      if (!previous) {
+        return { ...correction, stale: true, staleReason: 'duplicated', lineId: undefined, start: undefined, end: undefined };
+      }
+      occurrence = previous;
+    }
+
+    const line = byId.get(occurrence.lineId);
+    if (!line) {
+      return { ...correction, stale: true, staleReason: 'not-found', lineId: undefined, start: undefined, end: undefined };
+    }
+
+    const autoBraille = autoBrailleForRange(line.tokens, occurrence.start, occurrence.end);
+    if (correction.baselineBraille !== undefined && autoBraille !== correction.baselineBraille) {
+      return {
+        ...correction,
+        stale: true,
+        staleReason: 'braille-changed',
+        lineId: occurrence.lineId,
+        start: occurrence.start,
+        end: occurrence.end,
+      };
+    }
+
+    // 片段唯一且自动盲文未变：从过期恢复。曾被批准的也要重新核对（不静默复活）。
+    const wasStale = correction.stale;
+    const next: LocalCorrection = {
+      ...correction,
+      stale: false,
+      staleReason: undefined,
+      lineId: occurrence.lineId,
+      start: occurrence.start,
+      end: occurrence.end,
+    };
+    if (wasStale && next.status === 'approved') next.status = 'pending';
+    if (next.baselineBraille === undefined) next.baselineBraille = autoBraille;
+    return next;
+  });
+}
+
+/** 一行的渲染片段：普通 token，或被改字整体替换的片段。 */
+export type LinePiece =
+  | { kind: 'token'; token: BrailleToken }
+  | { kind: 'correction'; correction: LocalCorrection };
+
+/**
+ * 按有效改字合成一行的展示片段。
+ * 被改字区间覆盖的真实 token 合并为一个“改字”片段；未覆盖的系统标记原样保留，
+ * 位于改字区间内的系统标记（如被改好的未配置字符提示）隐藏。
+ */
+export function buildLinePieces(line: TextbookLine, corrections: LocalCorrection[]): LinePiece[] {
+  const active = activeOnLine(corrections, line.id);
+  const pieces: LinePiece[] = [];
+  let current: LocalCorrection | null = null;
+
+  for (const token of line.tokens) {
+    const interval = realInterval(token);
+    if (!interval) {
+      // 跨行连接/连字符等排版标记始终保留；仅“未配置字符”警告位于改字区间时隐藏。
+      const isWarningMarker = token.braille.includes('⟦');
+      const coveredBy = isWarningMarker
+        ? active.find((correction) => correction.start! <= token.offset && token.offset < correction.end!)
+        : undefined;
+      if (coveredBy) {
+        current = coveredBy;
+        continue;
+      }
+      if (current) {
+        pieces.push({ kind: 'correction', correction: current });
+        current = null;
+      }
+      pieces.push({ kind: 'token', token });
+      continue;
+    }
+
+    const cover = active.find((correction) => correction.start! <= interval[0] && interval[1] <= correction.end!);
+    if (cover) {
+      if (!current || current.id !== cover.id) {
+        if (current) pieces.push({ kind: 'correction', correction: current });
+        current = cover;
+      }
+    } else {
+      if (current) {
+        pieces.push({ kind: 'correction', correction: current });
+        current = null;
+      }
+      pieces.push({ kind: 'token', token });
+    }
+  }
+
+  if (current) pieces.push({ kind: 'correction', correction: current });
+  return pieces;
+}
+
+function pieceBraille(piece: LinePiece): string {
+  return piece.kind === 'correction' ? piece.correction.replacement : piece.token.braille;
+}
+
+/** 一行应用有效改字后的盲文串（空格与跨行标记保留）。 */
+export function effectiveBraille(line: TextbookLine, corrections: LocalCorrection[]): string {
+  return buildLinePieces(line, corrections).map(pieceBraille).join('');
 }
 
 export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial<TranscriptionRule>): RuleSet {
@@ -243,10 +471,50 @@ export function makeRule(source: string, output: string, suspicious: boolean, ki
   };
 }
 
+export function makeCorrection(
+  lineId: string,
+  fragment: string,
+  start: number,
+  end: number,
+  replacement: string,
+  reason: string,
+  baselineBraille: string,
+): LocalCorrection {
+  const now = new Date().toISOString();
+  return {
+    id: uid('correction'),
+    fragment,
+    replacement,
+    reason,
+    status: 'pending',
+    createdAt: now,
+    updatedAt: now,
+    lineId,
+    start,
+    end,
+    baselineBraille,
+    stale: false,
+  };
+}
+
+const activeByLine = (state: ProjectState): Map<string, LocalCorrection[]> => {
+  const map = new Map<string, LocalCorrection[]>();
+  state.corrections.forEach((correction) => {
+    if (correction.stale || correction.status === 'revoked' || !correction.lineId) return;
+    map.set(correction.lineId, [...(map.get(correction.lineId) ?? []), correction]);
+  });
+  return map;
+};
+
 export function outputText(state: ProjectState): string {
-  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${line.tokens.map((token) => token.braille).join('')}`).join('\n');
+  const byLine = activeByLine(state);
+  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${effectiveBraille(line, byLine.get(line.id) ?? [])}`).join('\n');
 }
 
 export function brailleCellCount(state: ProjectState): number {
-  return state.lines.reduce((total, line) => total + line.tokens.reduce((count, token) => count + token.braille.replace(/\s/g, '').length, 0), 0);
+  const byLine = activeByLine(state);
+  return state.lines.reduce(
+    (total, line) => total + effectiveBraille(line, byLine.get(line.id) ?? []).replace(/\s/g, '').length,
+    0,
+  );
 }

@@ -52,6 +52,29 @@ export interface ProofIssue {
   resolved: boolean;
 }
 
+export type CorrectionStatus = 'pending' | 'approved' | 'revoked';
+export type CorrectionStaleReason = 'not-found' | 'duplicated' | 'braille-changed';
+
+export interface LocalCorrection {
+  id: string;
+  /** 选中的原文片段，改字随片段文本匹配，不绑行号。 */
+  fragment: string;
+  /** 替换盲文，转录时优先于自动结果。 */
+  replacement: string;
+  reason: string;
+  status: CorrectionStatus;
+  createdAt: string;
+  updatedAt: string;
+  /** 最近一次唯一定位到的位置；过期时可能为空。 */
+  lineId?: string;
+  start?: number;
+  end?: number;
+  /** 创建（或重新确认）时该片段的自动盲文，用于判断规则变化过期。 */
+  baselineBraille?: string;
+  stale: boolean;
+  staleReason?: CorrectionStaleReason;
+}
+
 export interface VersionSnapshot {
   id: string;
   name: string;
@@ -67,6 +90,7 @@ export interface ProjectState {
   activeRuleSetId: string;
   ruleSets: RuleSet[];
   lines: TextbookLine[];
+  corrections: LocalCorrection[];
   selectedLineId: string;
   issues: ProofIssue[];
   versions: VersionSnapshot[];
